@@ -28,7 +28,7 @@ export type EngineKind = "image" | "video" | "storyboard";
 export interface EngineHealth {
   /** True when the server holds a key for this engine. */
   configured: boolean;
-  provider: "gemini" | "veo";
+  provider: "gemini" | "veo" | "cloudflare";
   model: string | null;
   /** Per-mode capabilities, e.g. { "video-to-video": false } */
   capabilities: Record<string, boolean>;

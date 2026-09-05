@@ -1,11 +1,13 @@
-// POST /api/generate-image — Text→Image and Image→Image with Gemini.
+// POST /api/generate-image — Text→Image and Image→Image.
 //
 // body: { action: "generate" | "transform", generationId, prompt, style, aspectRatio,
 //         quality?, count?, sourceImage?, strength? }
 // The generation row is created by the client (RLS-owned); this function
 // renders, stores the files in the caller's private storage folder and marks
-// the row completed. Nothing is ever faked: without GEMINI_API_KEY the row is
-// marked failed with a clear "not configured" message.
+// the row completed. Nothing is ever faked: without a configured engine the
+// row is marked failed with a clear "not configured" message.
+// Text→Image prefers Cloudflare Workers AI (free daily allocation); Gemini is
+// the premium engine and handles image→image when both are configured.
 import {
   buildPrompt,
   completeGeneration,
@@ -24,7 +26,7 @@ import {
   StudioError,
   toStudioError,
 } from "./_lib/core.js";
-import { gemini, geminiGenerateImage, NOT_CONFIGURED_MESSAGE } from "./_lib/gemini.js";
+import { selectImageEngine } from "./_lib/imageEngine.js";
 import type { ImageResultDto } from "../src/types/api.js";
 
 export const maxDuration = 120;
@@ -54,14 +56,14 @@ export const POST = handle(async (request) => {
 
   try {
     await setGeneration(ctx, generation.id, { status: "processing" });
-    if (!gemini.configured) throw new StudioError("not_configured", NOT_CONFIGURED_MESSAGE);
 
     let source: { bytes: Uint8Array; mimeType: string } | undefined;
+    let strength: number | undefined;
     let fullPrompt = buildPrompt(prompt, style, [QUALITY_HINT[quality]]);
     if (action === "transform") {
       if (!str(body.sourceImage, 400)) throw new StudioError("invalid_request", "Please upload an image to transform.");
       source = await downloadOwnedFile(ctx, body.sourceImage);
-      const strength = Math.min(1, Math.max(0.1, Number(body.strength) || 0.65));
+      strength = Math.min(1, Math.max(0.1, Number(body.strength) || 0.65));
       const fidelity =
         strength < 0.4
           ? "Keep the original composition, subject and details almost exactly; apply only subtle changes."
@@ -71,14 +73,15 @@ export const POST = handle(async (request) => {
       fullPrompt = `${fidelity} ${fullPrompt}`;
     }
 
-    // Gemini returns one image per request; render the requested count in parallel.
+    // The selected engine renders one image per call; render the requested count in parallel.
+    const engine = selectImageEngine(Boolean(source));
     const results = await Promise.allSettled(
-      Array.from({ length: count }, () => geminiGenerateImage({ prompt: fullPrompt, aspectRatio, source })),
+      Array.from({ length: count }, () => engine.generate({ prompt: fullPrompt, aspectRatio, source, strength })),
     );
     const images = results.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
     if (!images.length) {
       const first = results.find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
-      throw first ? toStudioError(first.reason) : new StudioError("unknown", "Gemini returned no image. Please try again.");
+      throw first ? toStudioError(first.reason) : new StudioError("unknown", "The engine returned no image. Please try again.");
     }
 
     const outputs = [];
@@ -87,9 +90,8 @@ export const POST = handle(async (request) => {
       const ref = await storeBytes(ctx, "images", `${ctx.userId}/${generation.id}/${i + 1}.${ext}`, images[i].bytes, images[i].mimeType);
       outputs.push({ ref, kind: "image" as const, sizeBytes: images[i].bytes.byteLength });
     }
-    const model = gemini.imageModel();
-    const recorded = await completeGeneration(ctx, generation.id, outputs, model);
-    const data: ImageResultDto = { outputs: recorded, provider: "gemini", model };
+    const recorded = await completeGeneration(ctx, generation.id, outputs, engine.provider);
+    const data: ImageResultDto = { outputs: recorded, provider: engine.provider, model: engine.model };
     return ok(data, request);
   } catch (e) {
     const err = toStudioError(e);
